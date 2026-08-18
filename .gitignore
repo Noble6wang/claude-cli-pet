@@ -1,0 +1,8 @@
+build/
+tests/
+aa/
+assets/reimu-spritesheet.png
+*.log
+*.pdb
+*.user
+*.suo
