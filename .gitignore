@@ -1,6 +1,7 @@
 build/
 tests/
 aa/
+releases/
 assets/reimu-spritesheet.png
 *.log
 *.pdb
