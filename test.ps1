@@ -136,14 +136,30 @@ if (-not $foregroundDismissMethod.Invoke($null, @($completedKind)) -or
 }
 $activityDismissMethod = $petWindowType.GetMethod('ShouldDismissNotificationOnActivity', [Reflection.BindingFlags]'NonPublic,Static')
 if (-not $activityDismissMethod.Invoke($null, @($true, $permissionKind)) -or
-    $activityDismissMethod.Invoke($null, @($true, $completedKind)) -or
+    -not $activityDismissMethod.Invoke($null, @($true, $completedKind)) -or
+    -not $activityDismissMethod.Invoke($null, @($true, $rateLimitedKind)) -or
+    -not $activityDismissMethod.Invoke($null, @($true, $errorKind)) -or
+    $activityDismissMethod.Invoke($null, @($true, $unknownKind)) -or
     $activityDismissMethod.Invoke($null, @($false, $permissionKind))) {
-    throw 'Claude activity did not dismiss only a pending permission notification.'
+    throw 'Claude activity did not replace persistent notifications with the working state.'
+}
+$ignoreWhileRunningMethod = $petWindowType.GetMethod('ShouldIgnoreNotificationWhileRunning', [Reflection.BindingFlags]'NonPublic,Static')
+$oldNotificationAt = [DateTime]::Parse('2026-08-27T02:13:45.831+08:00')
+$newTaskAt = [DateTime]::Parse('2026-08-27T02:13:45.871+08:00')
+$currentErrorAt = [DateTime]::Parse('2026-08-27T02:14:45.871+08:00')
+if (-not $ignoreWhileRunningMethod.Invoke($null, @($true, $completedKind, $oldNotificationAt, $newTaskAt)) -or
+    -not $ignoreWhileRunningMethod.Invoke($null, @($true, $rateLimitedKind, $oldNotificationAt, $newTaskAt)) -or
+    -not $ignoreWhileRunningMethod.Invoke($null, @($true, $errorKind, $oldNotificationAt, $newTaskAt)) -or
+    -not $ignoreWhileRunningMethod.Invoke($null, @($true, $permissionKind, $oldNotificationAt, $newTaskAt)) -or
+    $ignoreWhileRunningMethod.Invoke($null, @($true, $rateLimitedKind, $currentErrorAt, $newTaskAt)) -or
+    $ignoreWhileRunningMethod.Invoke($null, @($false, $rateLimitedKind, $oldNotificationAt, $newTaskAt))) {
+    throw 'Claude timestamp precedence rules for queued turns were incorrect.'
 }
 Write-Host 'PASS hidden idle status reopens for Claude activity'
 Write-Host 'PASS completion, permission and error notifications remain until explicit dismissal'
 Write-Host 'PASS completion and error notifications close when Claude returns to foreground'
-Write-Host 'PASS resumed Claude activity dismisses only permission notifications'
+Write-Host 'PASS resumed Claude activity replaces persistent notifications'
+Write-Host 'PASS stale notifications from a previous queued turn are ignored'
 
 $selectSpriteRowMethod = $petWindowType.GetMethod('SelectSpriteRow', [Reflection.BindingFlags]'NonPublic,Static')
 if ([int]$selectSpriteRowMethod.Invoke($null, @($false, $true, $false, $unknownKind)) -ne 2 -or
@@ -310,6 +326,25 @@ try {
         throw 'Claude transcript stop summary completion fallback was incorrect.'
     }
 
+    $modelCaveatEntry = @{ type = 'user'; uuid = 'model-caveat-fixture'; isMeta = $true; message = @{ role = 'user'; content = '<local-command-caveat>local command</local-command-caveat>' } } | ConvertTo-Json -Compress -Depth 8
+    $modelCommandEntry = @{ type = 'user'; uuid = 'model-command-fixture'; message = @{ role = 'user'; content = '<command-name>/model</command-name>`n<command-args>sonnet</command-args>' } } | ConvertTo-Json -Compress -Depth 8
+    $modelOutputEntry = @{ type = 'user'; uuid = 'model-output-fixture'; message = @{ role = 'user'; content = '<local-command-stdout>Set model to sonnet</local-command-stdout>' } } | ConvertTo-Json -Compress -Depth 8
+    $afterModelEntry = @{ type = 'user'; uuid = 'after-model-fixture'; message = @{ role = 'user'; content = 'run a real task' } } | ConvertTo-Json -Compress -Depth 8
+    [IO.File]::AppendAllText(
+        $transcriptPath,
+        ($modelCaveatEntry, $modelCommandEntry, $modelOutputEntry, $afterModelEntry -join [Environment]::NewLine) + [Environment]::NewLine,
+        (New-Object Text.UTF8Encoding($false)))
+    $afterModelTask = $bridgeProcess.StandardOutput.ReadLineAsync()
+    if (-not $afterModelTask.Wait(5000)) {
+        throw 'Claude transcript did not resume working after /model.'
+    }
+    $afterModelEvent = $afterModelTask.Result | ConvertFrom-Json
+    if ($afterModelEvent.type -ne 'activity' -or
+        $afterModelEvent.activity -ne 'working' -or
+        $afterModelEvent.eventId -ne 'working-after-model-fixture') {
+        throw 'Claude transcript treated /model metadata as working activity.'
+    }
+
     $activityEventDirectory = Join-Path $testRoot 'activity-events'
     New-Item -ItemType Directory -Path $activityEventDirectory -Force | Out-Null
     $activityPayload = @{ hook_event_name = 'UserPromptSubmit'; transcript_path = $transcriptPath; cwd = $projectRoot } | ConvertTo-Json -Compress
@@ -342,6 +377,60 @@ try {
     if ($activityEvent.type -ne 'activity' -or $activityEvent.activity -ne 'working') {
         throw 'Claude user prompt was not mapped to working activity.'
     }
+
+    $modelEventDirectory = Join-Path $testRoot 'model-events'
+    New-Item -ItemType Directory -Path $modelEventDirectory -Force | Out-Null
+    $modelPayload = @{ hook_event_name = 'UserPromptSubmit'; prompt = '<command-name>/model</command-name>`n<command-args>sonnet</command-args>'; transcript_path = $transcriptPath; cwd = $projectRoot } | ConvertTo-Json -Compress
+    $modelInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $modelInfo.FileName = 'powershell.exe'
+    $modelInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -EventDirectory "{1}"' -f $hook, $modelEventDirectory
+    $modelInfo.UseShellExecute = $false
+    $modelInfo.CreateNoWindow = $true
+    $modelInfo.RedirectStandardInput = $true
+    $modelProcess = New-Object System.Diagnostics.Process
+    $modelProcess.StartInfo = $modelInfo
+    try {
+        [void]$modelProcess.Start()
+        $modelProcess.StandardInput.Write($modelPayload)
+        $modelProcess.StandardInput.Close()
+        $modelProcess.WaitForExit(5000) | Out-Null
+        if (-not $modelProcess.HasExited -or $modelProcess.ExitCode -ne 0) {
+            throw 'Claude /model hook fixture failed.'
+        }
+    }
+    finally {
+        if ($modelProcess) { $modelProcess.Dispose() }
+    }
+    if (@(Get-ChildItem -LiteralPath $modelEventDirectory -Filter '*.json' -File).Count -ne 0) {
+        throw 'Claude /model did not stay out of the working state.'
+    }
+    $modelRawEventDirectory = Join-Path $testRoot 'model-raw-events'
+    New-Item -ItemType Directory -Path $modelRawEventDirectory -Force | Out-Null
+    $modelRawPayload = @{ hook_event_name = 'UserPromptSubmit'; transcript_path = $transcriptPath; cwd = $projectRoot; command_name = '/model' } | ConvertTo-Json -Compress
+    $modelRawInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $modelRawInfo.FileName = 'powershell.exe'
+    $modelRawInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -EventDirectory "{1}"' -f $hook, $modelRawEventDirectory
+    $modelRawInfo.UseShellExecute = $false
+    $modelRawInfo.CreateNoWindow = $true
+    $modelRawInfo.RedirectStandardInput = $true
+    $modelRawProcess = New-Object System.Diagnostics.Process
+    $modelRawProcess.StartInfo = $modelRawInfo
+    try {
+        [void]$modelRawProcess.Start()
+        $modelRawProcess.StandardInput.Write($modelRawPayload)
+        $modelRawProcess.StandardInput.Close()
+        $modelRawProcess.WaitForExit(5000) | Out-Null
+        if (-not $modelRawProcess.HasExited -or $modelRawProcess.ExitCode -ne 0) {
+            throw 'Claude /model raw hook fixture failed.'
+        }
+    }
+    finally {
+        if ($modelRawProcess) { $modelRawProcess.Dispose() }
+    }
+    if (@(Get-ChildItem -LiteralPath $modelRawEventDirectory -Filter '*.json' -File).Count -ne 0) {
+        throw 'Claude /model command_name did not stay out of the working state.'
+    }
+    Write-Host 'PASS Claude /model does not start the working animation'
 
     $diagnosticInfo = New-Object System.Diagnostics.ProcessStartInfo
     $diagnosticInfo.FileName = 'powershell.exe'
@@ -378,6 +467,7 @@ try {
     Write-Host 'PASS Claude hooks installer adds required events'
     Write-Host 'PASS Claude user prompt starts the working animation state'
     Write-Host 'PASS Claude transcript starts the working animation when the hook is missed'
+    Write-Host 'PASS Claude transcript ignores /model command metadata'
     Write-Host 'PASS Claude Stop events always reset the working animation state'
     Write-Host 'PASS Claude transcript stop summary provides completion fallback'
     Write-Host 'PASS Claude transcript monitor delivers 429 immediately'

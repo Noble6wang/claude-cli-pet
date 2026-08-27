@@ -84,7 +84,7 @@ $arguments = @(
     '/target:winexe',
     '/platform:x64',
     '/optimize+',
-    '/debug:pdbonly',
+    '/debug-',
     '/codepage:65001',
     "/out:$outputExe",
     "/win32icon:$outputIcon",

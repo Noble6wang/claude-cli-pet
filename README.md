@@ -2,6 +2,8 @@
 
 灵梦值守是以《东方 Project》博丽灵梦为形象、只提醒 Claude CLI 的 Windows 桌宠。它通过 Claude Code 官方 Hooks 接收事件，不读取其他应用通知，也不需要 Windows 全局通知访问权限；提醒使用接近 Codex 的深色气泡显示在桌宠旁边。
 
+当前版本：`v1.0.1`
+
 桌宠形象来源：[Reimu - codexpet.top](https://codexpet.top/pets/reimu--lingxiaotian)
 
 ## 提醒类型
@@ -25,6 +27,8 @@
 首次运行会自动在 `%USERPROFILE%\.claude\settings.json` 中安装 `UserPromptSubmit`、`Stop`、`PermissionRequest` 和 `Notification` Hooks，并先备份为 `settings.json.notify-pet.bak`。托盘菜单提供 Claude 通知测试、重新安装 Hooks、开机启动和退出。Hook 事件通过 `%LOCALAPPDATA%\NotifyPet\events` 中的短期队列文件交给灵梦值守，读取后立即删除，不发送到网络。
 
 空闲时不显示气泡；双击桌宠头部会临时显示“等待 Claude 命令”10 秒，没有新状态时自动隐藏。Claude 开始处理命令时，气泡会重新出现，第二行“正在思考”从左到右循环发亮，同时桌宠播放向左奔跑动画。权限提醒使用下跪动作，并一直保留到用户继续操作 Claude 或双击桌宠。所有错误使用思考动作；错误和完成提醒都会一直保留到切回 Claude CLI 或双击桌宠。只有头部可以拖动，桌宠身体、气泡和窗口中的其他透明区域都会让鼠标穿透到后方应用。拖动松开后会自动保存位置。
+
+`/model` 等仅切换本地配置的 Claude 斜杠命令不会被当作正在执行的任务；如果上一条命令显示了完成、权限或错误提醒，下一条真实命令开始后会自动切换回“正在执行”。
 
 ## 自定义形象
 

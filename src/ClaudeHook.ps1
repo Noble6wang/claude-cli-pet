@@ -49,6 +49,17 @@ function Get-MessageText {
     return [string]::Join([Environment]::NewLine, $parts)
 }
 
+function Test-NonWorkingPrompt {
+    param([string]$Prompt)
+
+    $text = [string]$Prompt
+    # Claude may pass slash commands either as plain text or command markup.
+    # /model changes local configuration and never starts a model turn.
+    return $text -match '(?is)^\s*<local-command-' -or
+        $text -match '(?is)^\s*<command-name>\s*/[a-z0-9_-]+.*?</command-name>' -or
+        $text -match '(?im)^\s*/model(?:\s|$)'
+}
+
 function Test-RateLimitEntry {
     param($Entry, [string]$Raw)
 
@@ -219,14 +230,29 @@ try {
     $transcriptPath = [string]$payload.transcript_path
 
     if ($eventName -eq 'UserPromptSubmit') {
-        Write-EventFile ([ordered]@{
-            type = 'activity'
-            activity = 'working'
-            source = 'Claude Code'
-            eventId = [Guid]::NewGuid().ToString('N')
-            transcriptPath = $transcriptPath
-            createdAt = [DateTime]::Now.ToString('o')
-        })
+        $promptParts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($candidate in @(
+            [string]$payload.prompt,
+            [string]$payload.command,
+            [string]$payload.command_name,
+            [string]$payload.message,
+            [string]$raw
+        )) {
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                $promptParts.Add($candidate)
+            }
+        }
+        $promptText = [string]::Join([Environment]::NewLine, $promptParts)
+        if (-not (Test-NonWorkingPrompt -Prompt $promptText)) {
+            Write-EventFile ([ordered]@{
+                type = 'activity'
+                activity = 'working'
+                source = 'Claude Code'
+                eventId = [Guid]::NewGuid().ToString('N')
+                transcriptPath = $transcriptPath
+                createdAt = [DateTime]::Now.ToString('o')
+            })
+        }
         exit 0
     }
 

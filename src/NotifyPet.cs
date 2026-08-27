@@ -29,8 +29,8 @@ using IOPath = System.IO.Path;
 [assembly: AssemblyProduct("Reimu Watch")]
 [assembly: AssemblyDescription("以博丽灵梦为形象的 Claude CLI 状态提醒桌宠")]
 [assembly: AssemblyCompany("Reimu Watch")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 
 namespace NotifyPet
 {
@@ -109,12 +109,12 @@ namespace NotifyPet
                         UpdateTrayText(status);
                     }));
                 },
-                delegate(bool working)
+                delegate(bool working, DateTime activityAt)
                 {
                     Log("Claude activity: " + (working ? "working" : "idle"));
                     petWindow.Dispatcher.BeginInvoke(new Action(delegate
                     {
-                        petWindow.SetTaskRunning(working);
+                        petWindow.SetTaskRunning(working, activityAt);
                     }));
                 });
             BuildTrayIcon(app);
@@ -460,7 +460,7 @@ namespace NotifyPet
         private readonly AppSettings settings;
         private readonly Action<PetNotification> onNotification;
         private readonly Action<string> onStatus;
-        private readonly Action<bool> onActivity;
+        private readonly Action<bool, DateTime> onActivity;
         private Process bridgeProcess;
         private bool disposed;
         private readonly ClaudeEventDeduplicator eventDeduplicator = new ClaudeEventDeduplicator();
@@ -469,7 +469,7 @@ namespace NotifyPet
             AppSettings settings,
             Action<PetNotification> onNotification,
             Action<string> onStatus,
-            Action<bool> onActivity)
+            Action<bool, DateTime> onActivity)
         {
             this.settings = settings;
             this.onNotification = onNotification;
@@ -496,7 +496,7 @@ namespace NotifyPet
 
             if (onActivity != null)
             {
-                onActivity(false);
+                onActivity(false, DateTime.Now);
             }
             StopBridge();
             if (!await Task.Run((Func<bool>)InstallHooks))
@@ -642,7 +642,14 @@ namespace NotifyPet
                 {
                     if (onActivity != null)
                     {
-                        onActivity(string.Equals(message.Activity, "working", StringComparison.OrdinalIgnoreCase));
+                        DateTime activityAt;
+                        if (!DateTime.TryParse(message.CreatedAt, out activityAt))
+                        {
+                            activityAt = DateTime.Now;
+                        }
+                        onActivity(
+                            string.Equals(message.Activity, "working", StringComparison.OrdinalIgnoreCase),
+                            activityAt);
                     }
                 }
                 else if (message.Type == "notification")
@@ -989,6 +996,7 @@ namespace NotifyPet
         private bool dragging;
         private bool dragMoved;
         private bool taskRunning;
+        private DateTime latestTaskStartedAt = DateTime.MinValue;
         private bool transientBubbleVisible;
         private bool bubbleHiddenByUser = true;
         private PetNotification currentNotification;
@@ -1727,16 +1735,36 @@ namespace NotifyPet
 
         public void SetTaskRunning(bool running)
         {
+            SetTaskRunning(running, DateTime.Now);
+        }
+
+        public void SetTaskRunning(bool running, DateTime eventTime)
+        {
+            if (eventTime == DateTime.MinValue)
+            {
+                eventTime = DateTime.Now;
+            }
+            if (!running && taskRunning && eventTime < latestTaskStartedAt)
+            {
+                Program.Log("ignored stale idle activity from an earlier Claude turn");
+                return;
+            }
             taskRunning = running;
             if (running)
             {
+                if (eventTime > latestTaskStartedAt)
+                {
+                    latestTaskStartedAt = eventTime;
+                }
                 idlePreviewTimer.Stop();
                 bubbleHiddenByUser = true;
+                // A new real prompt supersedes every notification left by the
+                // previous turn, including a queued 429/error/completion.
+                queue.Clear();
                 if (currentNotification != null &&
                     ShouldDismissNotificationOnActivity(running, currentNotification.Kind))
                 {
                     bubbleTimer.Stop();
-                    queue.Clear();
                     currentNotification = null;
                     transientBubbleVisible = false;
                 }
@@ -1744,6 +1772,11 @@ namespace NotifyPet
             if (customSpriteLoaded)
             {
                 UpdateSpriteAnimation(0);
+            }
+            if (!running && !transientBubbleVisible && queue.Count > 0)
+            {
+                ShowNext();
+                return;
             }
             if (ShouldShowPersistentStatus(running, bubbleHiddenByUser, transientBubbleVisible))
             {
@@ -1785,7 +1818,25 @@ namespace NotifyPet
             bool running,
             ClaudeNotificationKind kind)
         {
-            return running && kind == ClaudeNotificationKind.PermissionRequired;
+            return running && kind != ClaudeNotificationKind.Unknown;
+        }
+
+        internal static bool ShouldIgnoreNotificationWhileRunning(
+            bool running,
+            ClaudeNotificationKind kind,
+            DateTime notificationCreatedAt,
+            DateTime taskStartedAt)
+        {
+            if (!running || notificationCreatedAt == DateTime.MinValue ||
+                taskStartedAt == DateTime.MinValue)
+            {
+                return false;
+            }
+            var actionable = kind == ClaudeNotificationKind.Completed ||
+                kind == ClaudeNotificationKind.PermissionRequired ||
+                kind == ClaudeNotificationKind.RateLimited ||
+                kind == ClaudeNotificationKind.Error;
+            return actionable && notificationCreatedAt <= taskStartedAt;
         }
 
         public void SetListenerStatus(string status)
@@ -1826,6 +1877,15 @@ namespace NotifyPet
             }
             idlePreviewTimer.Stop();
             bubbleHiddenByUser = true;
+            if (ShouldIgnoreNotificationWhileRunning(
+                taskRunning,
+                notification.Kind,
+                notification.CreatedAt,
+                latestTaskStartedAt))
+            {
+                Program.Log("ignored stale notification from an earlier Claude turn: " + notification.Kind);
+                return;
+            }
             if (notification.Kind == ClaudeNotificationKind.Completed ||
                  notification.Kind == ClaudeNotificationKind.PermissionRequired ||
                  notification.Kind == ClaudeNotificationKind.RateLimited ||

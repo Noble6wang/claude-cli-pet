@@ -175,21 +175,39 @@ function Get-TurnEventId {
     return Get-ErrorEventId -Entry $Entry -Path $Path -Raw $Raw
 }
 
+function Test-NonWorkingPrompt {
+    param([string]$Prompt)
+
+    $text = [string]$Prompt
+    # Claude writes slash-command metadata and its local output as user records.
+    # /model changes local configuration and never starts a model turn.
+    return $text -match '(?is)^\s*<local-command-' -or
+        $text -match '(?is)^\s*<command-name>\s*/[a-z0-9_-]+.*?</command-name>' -or
+        $text -match '(?im)^\s*/model(?:\s|$)'
+}
+
 function Test-HumanPromptEntry {
     param($Entry)
 
     if ([string]$Entry.type -ne 'user' -or $null -eq $Entry.message) {
         return $false
     }
+    if ($Entry.isMeta -eq $true) {
+        return $false
+    }
     if ($Entry.message.content -is [string]) {
-        return $true
+        return -not (Test-NonWorkingPrompt -Prompt ([string]$Entry.message.content))
     }
     foreach ($block in @($Entry.message.content)) {
         if ([string]$block.type -eq 'tool_result') {
             return $false
         }
     }
-    return $true
+    $promptText = [string]::Join(
+        [Environment]::NewLine,
+        @($Entry.message.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { [string]$_.text }))
+    return -not [string]::IsNullOrWhiteSpace($promptText) -and
+        -not (Test-NonWorkingPrompt -Prompt $promptText)
 }
 
 function Scan-TranscriptEvents {
@@ -220,14 +238,14 @@ function Scan-TranscriptEvents {
                         if (Test-HumanPromptEntry -Entry $entry) {
                             $ActiveTurns[$file.FullName] = Get-TurnEventId -Entry $entry -Path $file.FullName -Raw $line
                             $TurnHasErrors[$file.FullName] = $false
-                        }
-                        Send-BridgeMessage @{
-                            type = 'activity'
-                            activity = 'working'
-                            source = 'Claude Code'
-                            eventId = if ([string]::IsNullOrWhiteSpace([string]$entry.uuid)) { [Guid]::NewGuid().ToString('N') } else { 'working-' + [string]$entry.uuid }
-                            transcriptPath = $file.FullName
-                            createdAt = if ([string]::IsNullOrWhiteSpace([string]$entry.timestamp)) { [DateTime]::Now.ToString('o') } else { [string]$entry.timestamp }
+                            Send-BridgeMessage @{
+                                type = 'activity'
+                                activity = 'working'
+                                source = 'Claude Code'
+                                eventId = if ([string]::IsNullOrWhiteSpace([string]$entry.uuid)) { [Guid]::NewGuid().ToString('N') } else { 'working-' + [string]$entry.uuid }
+                                transcriptPath = $file.FullName
+                                createdAt = if ([string]::IsNullOrWhiteSpace([string]$entry.timestamp)) { [DateTime]::Now.ToString('o') } else { [string]$entry.timestamp }
+                            }
                         }
                         continue
                     }
